@@ -1,66 +1,111 @@
-import { NextResponse } from 'next/server'
-import { stripe } from '@/lib/stripe'
-import { createClient } from '@/lib/supabase/server'
+// app/api/stripe/webhook/route.ts
 
-export async function POST() {
-  const supabase = await createClient()
-  const { data, error } = await supabase.auth.getUser()
+import { NextResponse } from "next/server";
+import Stripe from "stripe";
+import { stripe } from "@/lib/stripe";
+import { createClient } from "@supabase/supabase-js";
 
-  if (error || !data.user) {
-    return NextResponse.json({ error: 'Not signed in' }, { status: 401 })
+type StripeSubMinimal = {
+  id: string;
+  customer: string | { id: string };
+  status: string;
+  current_period_end?: number | null;
+};
+
+export async function POST(req: Request) {
+  const sig = req.headers.get("stripe-signature");
+  if (!sig) {
+    return NextResponse.json({ error: "Missing Stripe signature" }, { status: 400 });
   }
 
-  const user = data.user
-  const priceId = process.env.STRIPE_PRICE_ID!
-  const appUrl = process.env.NEXT_PUBLIC_APP_URL!
-
-  const { data: profile, error: profileErr } = await supabase
-    .from('profiles')
-    .select('stripe_customer_id, email')
-    .eq('id', user.id)
-    .single()
-
-  if (profileErr) {
-    return NextResponse.json({ error: `Profile read failed: ${profileErr.message}` }, { status: 500 })
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+  if (!webhookSecret) {
+    return NextResponse.json({ error: "Missing STRIPE_WEBHOOK_SECRET" }, { status: 500 });
   }
 
-  let customerId = profile?.stripe_customer_id ?? null
-  let createdNewCustomer = false
+  const body = await req.text();
 
-  if (!customerId) {
-    createdNewCustomer = true
-    const customer = await stripe.customers.create({
-      email: user.email ?? profile?.email ?? undefined,
-      metadata: { supabase_user_id: user.id },
-    })
-    customerId = customer.id
+  let event: Stripe.Event;
+  try {
+    event = stripe.webhooks.constructEvent(body, sig, webhookSecret);
+  } catch (err: any) {
+    return NextResponse.json(
+      { error: `Webhook signature verification failed: ${err.message}` },
+      { status: 400 }
+    );
+  }
 
-    const { error: updErr } = await supabase
-      .from('profiles')
-      .update({ stripe_customer_id: customerId })
-      .eq('id', user.id)
+  const supabase = createClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.SUPABASE_SERVICE_ROLE_KEY!,
+    { auth: { persistSession: false } }
+  );
 
-    if (updErr) {
-      return NextResponse.json(
-        { error: `Profile update failed: ${updErr.message}`, customerId },
-        { status: 500 }
-      )
+  try {
+    switch (event.type) {
+      case "checkout.session.completed": {
+        const session = event.data.object as Stripe.Checkout.Session;
+
+        const userId = session.client_reference_id;
+        const customerId =
+          typeof session.customer === "string" ? session.customer : null;
+        const subscriptionId =
+          typeof session.subscription === "string" ? session.subscription : null;
+
+        if (!userId) break;
+
+        const { error } = await supabase
+          .from("profiles")
+          .update({
+            plan: "pro",
+            stripe_customer_id: customerId,
+            stripe_subscription_id: subscriptionId,
+          })
+          .eq("id", userId);
+
+        if (error) throw new Error(`Supabase update failed: ${error.message}`);
+
+        break;
+      }
+
+      case "customer.subscription.updated":
+      case "customer.subscription.deleted": {
+        const sub = event.data.object as unknown as StripeSubMinimal;
+
+        const customerId =
+          typeof sub.customer === "string" ? sub.customer : sub.customer?.id;
+
+        if (!customerId) break;
+
+        const isActive =
+          event.type !== "customer.subscription.deleted" &&
+          ["active", "trialing"].includes(sub.status);
+
+        const currentPeriodEnd =
+          sub.current_period_end
+            ? new Date(sub.current_period_end * 1000).toISOString()
+            : null;
+
+        const { error } = await supabase
+          .from("profiles")
+          .update({
+            plan: isActive ? "pro" : "free",
+            stripe_subscription_id: sub.id,
+            current_period_end: currentPeriodEnd,
+          })
+          .eq("stripe_customer_id", customerId);
+
+        if (error) throw new Error(`Supabase update failed: ${error.message}`);
+
+        break;
+      }
+
+      default:
+        break;
     }
+
+    return NextResponse.json({ received: true }, { status: 200 });
+  } catch (err: any) {
+    return NextResponse.json({ error: err.message ?? "Webhook handler error" }, { status: 500 });
   }
-
-  const session = await stripe.checkout.sessions.create({
-    mode: 'subscription',
-    customer: customerId!,
-    line_items: [{ price: priceId, quantity: 1 }],
-    success_url: `${appUrl}/billing/success`,
-    cancel_url: `${appUrl}/billing/cancel`,
-    client_reference_id: user.id,
-  })
-
-  return NextResponse.json({
-    url: session.url,
-    customerId,
-    createdNewCustomer,
-  })
 }
-
