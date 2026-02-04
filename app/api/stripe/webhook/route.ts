@@ -1,9 +1,8 @@
-// TEMP BREAK TEST
 // app/api/stripe/webhook/route.ts
-// EXERCISE 4A — INTENTIONALLY INSECURE VERSION (break signature verification on purpose)
 
 import { NextResponse } from "next/server";
 import Stripe from "stripe";
+import { stripe } from "@/lib/stripe";
 import { createClient } from "@supabase/supabase-js";
 
 type StripeSubMinimal = {
@@ -14,16 +13,26 @@ type StripeSubMinimal = {
 };
 
 export async function POST(req: Request) {
-  // IMPORTANT: For the break, we do NOT require stripe-signature and we do NOT constructEvent.
-  // Anyone can POST JSON and it will be treated as a Stripe event.
+  const sig = req.headers.get("stripe-signature");
+  if (!sig) {
+    return NextResponse.json({ error: "Missing Stripe signature" }, { status: 400 });
+  }
+
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+  if (!webhookSecret) {
+    return NextResponse.json({ error: "Missing STRIPE_WEBHOOK_SECRET" }, { status: 500 });
+  }
 
   const body = await req.text();
 
   let event: Stripe.Event;
   try {
-    event = JSON.parse(body) as Stripe.Event;
+    event = stripe.webhooks.constructEvent(body, sig, webhookSecret);
   } catch (err: any) {
-    return NextResponse.json({ error: `Invalid JSON: ${err.message}` }, { status: 400 });
+    return NextResponse.json(
+      { error: `Webhook signature verification failed: ${err.message}` },
+      { status: 400 }
+    );
   }
 
   const supabase = createClient(
@@ -38,7 +47,8 @@ export async function POST(req: Request) {
         const session = event.data.object as Stripe.Checkout.Session;
 
         const userId = session.client_reference_id;
-        const customerId = typeof session.customer === "string" ? session.customer : null;
+        const customerId =
+          typeof session.customer === "string" ? session.customer : null;
         const subscriptionId =
           typeof session.subscription === "string" ? session.subscription : null;
 
@@ -71,9 +81,10 @@ export async function POST(req: Request) {
           event.type !== "customer.subscription.deleted" &&
           ["active", "trialing"].includes(sub.status);
 
-        const currentPeriodEnd = sub.current_period_end
-          ? new Date(sub.current_period_end * 1000).toISOString()
-          : null;
+        const currentPeriodEnd =
+          sub.current_period_end
+            ? new Date(sub.current_period_end * 1000).toISOString()
+            : null;
 
         const { error } = await supabase
           .from("profiles")
@@ -101,4 +112,5 @@ export async function POST(req: Request) {
     );
   }
 }
+
 
